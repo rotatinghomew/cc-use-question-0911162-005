@@ -25,4 +25,15 @@ class DomainSignalTests(unittest.TestCase):
         changed_signal=capacity_pressure(changed)
         self.assertTrue(base.score != changed_signal.score or base.severity != changed_signal.severity)
 
+    def test_zero_units_is_unavailable_not_saturated(self):
+        empty=dict(self.payload); empty['capacity_units']=0; empty['request_queue']=0
+        signal=capacity_pressure(empty)
+        self.assertFalse(signal.evidence['allocatable'])
+        self.assertIsNone(signal.evidence['saturation'])
+        self.assertEqual(signal.evidence['capacity_state'],'unavailable')
+        self.assertEqual(signal.severity,'critical')
+        saturated=dict(self.payload); saturated['capacity_units']=1; saturated['request_queue']=10**6
+        self.assertEqual(capacity_pressure(saturated).evidence['capacity_state'],'overloaded')
+        self.assertTrue(capacity_pressure(saturated).evidence['allocatable'])
+
 if __name__=='__main__': unittest.main()

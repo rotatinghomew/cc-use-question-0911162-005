@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
-from public_ai_capacity.telemetry.service_event import ContractError, Decision, DomainRecord, RuleResult, bounded
+from public_ai_capacity.telemetry.service_event import ContractError, Decision, DomainRecord, RuleResult, bounded, finite_number, normalized_text
 from public_ai_capacity.resilience.outage_replay import grouped_metrics, record_score
 from public_ai_capacity.forecast.capacity_rules import evaluate
 
@@ -32,6 +32,14 @@ def plan_transition(record: DomainRecord, target: str, context: Mapping[str, Any
     structurally_allowed = target in allowed_targets(record.ledger)
     if not structurally_allowed:
         reasons.append('transition is not adjacent in the lifecycle')
+    # Without available units a service window cannot be reserved or served;
+    # such forward moves out of 'observed'/'forecasted' must be refused rather
+    # than look like an ordinary score-based refusal.  Administrative closure
+    # and earlier states stay reachable through the normal lifecycle rules.
+    allocation_targets = {STATES.index(name) for name in ('reserved', 'serving', 'recovering')}
+    if STATES.index(target) in allocation_targets and (
+            _available_units(record) <= 0.0 or context.get('capacity_allocatable') is False):
+        reasons.append('no available capacity units for reservation or service')
     threshold = float(context.get('transition_threshold', 0.42))
     if scorecard['score'] < threshold:
         reasons.append('record score is below the transition threshold')
@@ -1133,6 +1141,28 @@ def guard_report(record: DomainRecord, context: Mapping[str, Any] | None = None)
     return {'passed': sum(item[0] for item in results), 'failed': sum(not item[0] for item in results),
             'messages': [item[1] for item in results]}
 
+UNAVAILABLE_OUTCOME = 'unallocatable'
+
+
+def _available_units(record: DomainRecord) -> float:
+    """Return the units this window can actually allocate (never negative)."""
+    value = record.payload.get('capacity_units')
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        try:
+            return max(0.0, finite_number(value))
+        except ContractError:
+            return 0.0
+    text = normalized_text(value)
+    if not text:
+        return 0.0
+    try:
+        return max(0.0, finite_number(text))
+    except ContractError:
+        return 0.0
+
+
 def decide(record: DomainRecord, context: Mapping[str, Any] | None = None) -> Decision:
     context = context or {}
     rules = evaluate(record, context)
@@ -1140,6 +1170,15 @@ def decide(record: DomainRecord, context: Mapping[str, Any] | None = None) -> De
     guards = guard_report(record, context)
     effective_score = scorecard['score'] * 0.65 + float(context.get('domain_signal', 0.5)) * 0.35
     critical = sum(item.severity == 'critical' for item in rules)
+    units = _available_units(record)
+    # A row without available units is never allocatable, however healthy its
+    # other fields look.  An explicit aggregate flag can also veto allocation.
+    allocatable = units > 0.0 and bool(context.get('capacity_allocatable', True))
+    if not allocatable:
+        reasons = (f"score={effective_score:.6f}", 'capacity=unavailable',
+                   'capacity_state=unavailable', f"capacity_units={units:.6f}",
+                   'allocation=not_possible')
+        return Decision(record.record_id, UNAVAILABLE_OUTCOME, effective_score, reasons, rules, scorecard['metrics'])
     if context.get('domain_severity') == 'critical':
         outcome = 'hold'
     elif critical:
@@ -1150,12 +1189,24 @@ def decide(record: DomainRecord, context: Mapping[str, Any] | None = None) -> De
         outcome = 'review'
     else:
         outcome = 'reject'
-    reasons = (f"score={effective_score:.6f}", f"critical={critical}",
-               f"guards={guards['passed']}/{guards['passed'] + guards['failed']}")
-    return Decision(record.record_id, outcome, effective_score, reasons, rules, scorecard['metrics'])
+    reasons = [f"score={effective_score:.6f}", f"critical={critical}",
+               f"guards={guards['passed']}/{guards['passed'] + guards['failed']}"]
+    capacity_state = context.get('capacity_state')
+    if capacity_state in {'overloaded', 'balanced'}:
+        reasons.append(f"capacity_state={capacity_state}")
+    overload = context.get('capacity_overload')
+    if overload is not None and float(overload) > 0.0:
+        # Capacity exists but demand exceeds it: keep the overload explanation
+        # instead of flattening it into an indistinguishable "100% full".
+        reasons.append(f"capacity_overload={float(overload):.6f}")
+    return Decision(record.record_id, outcome, effective_score, tuple(reasons), rules, scorecard['metrics'])
 
 def advance_for_outcome(record: DomainRecord, decision: Decision) -> DomainRecord:
     current = STATES.index(record.ledger)
+    if decision.outcome == UNAVAILABLE_OUTCOME:
+        # An unavailable window must not be mistaken for a terminal decision:
+        # leave the lifecycle position untouched instead of advancing it.
+        return record
     if decision.outcome == 'approve' and current + 1 < len(STATES):
         return record.with_ledger(STATES[current + 1])
     if decision.outcome == 'hold' and STATES[-1] != record.ledger:

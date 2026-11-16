@@ -20,3 +20,22 @@ class CapacityReplayTests(unittest.TestCase):
         rows = [self.record("a"), self.record("b")]
         self.assertGreater(journey_pressure(rows[0])["total"], 0.0)
         self.assertGreater(forecast_balance(rows)["capacity"], forecast_balance(rows)["demand"])
+
+    def test_zero_capacity_balance_is_not_reported_as_full_load(self):
+        rows = [self.record("a").with_payload({"capacity_units": 0}), self.record("b").with_payload({"capacity_units": 0})]
+        balance = forecast_balance(rows)
+        self.assertEqual(balance["capacity"], 0.0)
+        self.assertIsNone(balance["utilization"])
+        self.assertFalse(balance["allocatable"])
+        self.assertEqual(balance["capacity_state"], "unavailable")
+        self.assertIsNone(balance["overload"])
+        self.assertIsNone(shortest_capacity_path(route_graph(rows), "a", "c", 0))
+
+    def test_overload_keeps_ratio_and_shortfall(self):
+        rows = [self.record("a").with_payload({"capacity_units": 1, "priority": 40}),
+                self.record("b").with_payload({"capacity_units": 1, "priority": 40})]
+        balance = forecast_balance(rows)
+        self.assertTrue(balance["allocatable"])
+        self.assertEqual(balance["capacity_state"], "overloaded")
+        self.assertGreater(balance["utilization"], 1.0)
+        self.assertGreater(balance["overload"], 0.0)

@@ -38,13 +38,15 @@ def shortest_capacity_path(graph: Mapping[str, list[tuple[str, float, float]]], 
     while queue:
         minutes, node, route, capacity = heapq.heappop(queue)
         if node == end:
+            if capacity <= 0.0:
+                return None
             left = max(0.0, capacity - demand)
             return RouteOption(route, minutes, minutes * 0.7 + demand * 1.3, left, 0.0)
         if minutes >= seen.get(node, float("inf")):
             continue
         seen[node] = minutes
         for target, edge_minutes, edge_capacity in graph.get(node, []):
-            if edge_capacity < demand:
+            if edge_capacity <= 0.0 or edge_capacity < demand:
                 continue
             heapq.heappush(queue, (minutes + edge_minutes, target, route + (target,), min(capacity, edge_capacity)))
     return None
@@ -61,22 +63,54 @@ def journey_pressure(record: DomainRecord) -> dict[str, float]:
             "total": bounded(border * .3 + warehouse * .25 + customs_risk * .25 + cold_risk * .2)}
 
 
-def forecast_balance(records: Iterable[DomainRecord]) -> dict[str, float]:
+def forecast_balance(records: Iterable[DomainRecord]) -> dict[str, Any]:
+    """Aggregate capacity balance for a set of service windows.
+
+    ``utilization`` is only meaningful when at least one capacity unit exists.
+    With no available units the ratio is undefined (``None``) and the balance is
+    explicitly marked as not allocatable, instead of being clamped to a normal
+    "fully loaded" ratio.  When capacity exists but demand exceeds it the raw
+    ratio is reported above ``1.0`` and ``overload`` records the shortfall, so
+    resource exhaustion stays distinguishable from missing input capacity.
+    """
     rows = list(records)
     capacities = [max(0.0, finite_number(row.payload.get("capacity_units", 0.0))) for row in rows]
     demands = [1.0 + max(0.0, finite_number(row.payload.get("priority", 0.0))) for row in rows]
     capacity = sum(capacities)
     demand = sum(demands)
-    return {"capacity": capacity, "demand": demand, "utilization": bounded(demand / max(1.0, capacity)),
-            "slack": max(0.0, capacity - demand)}
+    allocatable = capacity > 0.0
+    if allocatable:
+        utilization = demand / capacity
+        overload = max(0.0, demand - capacity)
+        capacity_state = "overloaded" if overload > 0.0 else "balanced"
+    else:
+        utilization = None
+        overload = None
+        capacity_state = "unavailable"
+    return {"capacity": capacity, "demand": demand,
+            "utilization": utilization, "slack": max(0.0, capacity - demand),
+            "overload": overload, "allocatable": allocatable,
+            "capacity_state": capacity_state}
 
 
-def derive_context(record: DomainRecord, repository: Any) -> dict[str, float]:
+def derive_context(record: DomainRecord, repository: Any) -> dict[str, Any]:
     rows = repository.list_records() or [record]
     pressure = journey_pressure(record)
     balance = forecast_balance(rows)
+    allocatable = balance["allocatable"]
+    # Keep the historical bounded ratio for weighting so scenarios that do have
+    # capacity keep their previous weights; an unavailable balance is treated as
+    # maximally constrained and carries explicit flags instead of a fake ratio.
+    bounded_utilization = (bounded(balance["demand"] / max(1.0, balance["capacity"]))
+                           if allocatable else 1.0)
+    resilience_ratio = (bounded(balance["slack"] / max(1.0, balance["capacity"]))
+                        if allocatable else 0.0)
     return {"route_pressure_weight": 0.7 + pressure["total"] * 0.7,
             "eta_reliability_weight": 1.1 - pressure["border"] * 0.4,
-            "capacity_balance_weight": 1.1 - balance["utilization"] * 0.3,
+            "capacity_balance_weight": 1.1 - bounded_utilization * 0.3,
             "cold_chain_risk_weight": 0.7 + pressure["cold"] * 0.7,
-            "forecast_resilience_weight": 0.6 + bounded(balance["slack"] / max(1.0, balance["capacity"])) * 0.6}
+            "forecast_resilience_weight": 0.6 + resilience_ratio * 0.6,
+            "capacity_allocatable": allocatable,
+            "capacity_utilization": (balance["utilization"] if allocatable else None),
+            "capacity_overload": (balance["overload"] if allocatable else None),
+            "capacity_state": balance["capacity_state"]}

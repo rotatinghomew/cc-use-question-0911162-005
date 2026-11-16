@@ -138,6 +138,37 @@ class WorkflowTests(unittest.TestCase):
         second = advance_for_outcome(self.record, decision)
         self.assertEqual(first, second)
 
+    def test_zero_capacity_decision_is_unallocatable(self):
+        record = self.record.with_payload({'capacity_units': 0})
+        decision = decide(record)
+        self.assertEqual(decision.outcome, 'unallocatable')
+        self.assertTrue(any('capacity=unavailable' in reason for reason in decision.reasons))
+        self.assertNotIn('capacity_overload', ' '.join(decision.reasons))
+
+    def test_zero_capacity_does_not_advance_window(self):
+        record = self.record.with_payload({'capacity_units': 0})
+        decision = decide(record)
+        advanced = advance_for_outcome(record, decision)
+        self.assertEqual(advanced.ledger, record.ledger)
+        self.assertEqual(advanced.version, record.version)
+        self.assertEqual(advanced.fingerprint, record.fingerprint)
+
+    def test_zero_capacity_cannot_reserve_or_serve(self):
+        record = self.record.with_payload({'capacity_units': 0})
+        for target in (STATES[2], STATES[3], STATES[4]):
+            plan = plan_transition(record, target, {'transition_threshold': 0.0})
+            self.assertFalse(plan.allowed)
+            self.assertTrue(any('no available capacity' in reason for reason in plan.reasons))
+            with self.assertRaisesRegex(ContractError, 'no available capacity'):
+                apply_transition(record, target, {'transition_threshold': 0.0})
+
+    def test_overload_explanation_is_preserved(self):
+        record = self.record.with_payload({'capacity_units': 1, 'priority': 40})
+        decision = decide(record, {'capacity_state': 'overloaded', 'capacity_overload': 12.5,
+                                   'capacity_utilization': 3.0})
+        self.assertTrue(any('capacity_state=overloaded' in reason for reason in decision.reasons))
+        self.assertTrue(any('capacity_overload=12.500000' in reason for reason in decision.reasons))
+
 
 class EndToEndTests(unittest.TestCase):
     def setUp(self):
@@ -199,6 +230,25 @@ class EndToEndTests(unittest.TestCase):
         result = application.inspect()
         self.assertEqual(len(result["records"]), len(load_records()))
         self.assertEqual(len(result["decisions"]), len(load_records()))
+
+    def test_zero_capacity_fixture_holds_window_state(self):
+        fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        for entry in fixture["records"]:
+            entry["payload"]["capacity_units"] = 0
+            entry["payload"]["capacity_load"] = 0
+            entry["payload"]["request_queue"] = 0
+        path = self.root / "zero-capacity.json"
+        path.write_text(json.dumps(fixture), encoding="utf-8")
+        database = self.root / "zero.sqlite3"
+        output = self.root / "zero-output"
+        result = run(path, database, output)
+        self.assertEqual(result["records"], len(fixture["records"]))
+        self.assertEqual(result["snapshot"]["ledgers"], {"observed": len(fixture["records"])})
+        decisions = json.loads((output / "decisions.json").read_text(encoding="utf-8"))
+        self.assertTrue(all(item["outcome"] == "unallocatable" for item in decisions))
+        summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["outcomes"], {"unallocatable": len(fixture["records"])})
+        self.assertTrue(verify(database, output)["ok"])
 
 
 class ScenarioVariationTests(unittest.TestCase):
